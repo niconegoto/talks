@@ -1,0 +1,151 @@
+Goのスケジューラー実装とハマりポイント
+golang.tokyo #4
+15:04 1 Mar 2017
+Tags: golang, concurrency
+
+Koki Ide
+niconegoto@yahoo.co.jp
+@niconegoto (Twitter, Github)
+
+* Koki Ide
+.image image/koki.jpg 200 200
+- @niconegoto (Twitter, Github)
+- メルカリ/ソウゾウ
+- GoでAPI書いてます
+
+* 去年のアドベントカレンダー
+.image image/qiita.png 500 800
+
+* 今日はなすこと
+- Groutineの実装デザイン
+- スケジューラーの罠
+
+* Groutineの実装デザイン
+
+* スレッドにはどのような種類があるのか
+- N：1 複数のユーザー空間スレッドが1つのOSスレッドで実行
+- 1：1 1つの実行スレッドが1つのOSスレッドと一致
+- M：N 任意の数のOSスレッドに任意の数のゴルーチンをスケジューリング
+GoはM:Nを採用
+
+* それぞれの特徴
+- N：1
+:+1: コンテキストスイッチが非常に迅速である
+:-1: マルチコアシステムを利用することができない
+
+- 1：1
+:+1: マシン上のすべてのコアを利用できる
+:-1: トラップ(強制的割り込み)する必要があるため、コンテキストスイッチが遅い
+
+- M：N
+:+1: コンテキストスイッチをすばやく実行し、システム内のすべてのコアを活用できる
+:-1: いいとこ取りだけどスケジューラーへの追加が煩雑
+
+* 用語説明
+.image image/icon.png 280 800
+.caption _Image_ by [[https://morsmachine.dk/go-scheduler][Morsing's Blog]]
+
+* 用語説明
+- M(Machine)
+OSスレッドを表します。これはOSによって管理される実行スレッドであり、標準のPOSIXスレッドとよく似ています。
+
+- G(Goroutine)
+スタックには、ブロックされている可能性があるチャネルのように、スタック、命令ポインタ、およびゴルーチンのスケジューリングに重要なその他の情報が含まれます。
+
+- P(processor)
+コンテキスト。
+単一のスレッドでGoコードを実行するスケジューラのローカライズ版のようなもの
+N：1スケジューラからM：Nスケジューラに移行することができる重要な部分
+
+* P(processor)
+Pの数は起動時にGOMAXPROCS環境変数の値または実行時関数GOMAXPROCS（）によって設定
+Goプロセスの呼び出しを個々のコンピュータに合わせることができる(4コアPCは4つのスレッドでGoコードを実行する)
+
+* 二つのスレッドで作業している例
+.image image/default.png 400 600
+.caption _Image_ by [[https://morsmachine.dk/go-scheduler][Morsing's Blog]]
+
+* 二つのスレッドで作業している例
+Go文が実行されるとMはリストからPをポップする
+.image image/default.png 280 800
+
+* 二つのスレッドで作業している例
+Go文が実行されるたびにrunqueuesというキューのリストからGをポップする
+Pがスケジューリングポイント(メモリが一貫性をもつポイント)までゴルーチンを実行すると、
+その実行キューからGがポップされ、スタックと命令ポインタが設定され、ゴルーチンの実行が開始される
+
+* 二つのスレッドで作業している例
+各Pにはローカルの実行キューがある
+1.1以前のバージョンのGoスケジューラではグローバル実行キューしかなかった
+
+* システムコールされたとき
+.image image/syscall.png 400 600
+.caption _Image_ by [[https://morsmachine.dk/go-scheduler][Morsing's Blog]]
+
+* システムコールされたとき
+Mはコードを実行していてシステムコールでブロックすることができないため、
+スケジューリングを維持できるようにPをハンドオフする必要がある
+
+* システムコールされたとき
+M0はシステムコールを作成したgoroutineを保持
+Pをリストにプッシュして、それをM1がポップ
+
+* runqueuesが空になったら
+.image image/steal.png 400 600
+.caption _Image_ by [[https://morsmachine.dk/go-scheduler][Morsing's Blog]]
+
+* グローバル実行キュー
+グローバル実行キューは、ローカル実行キューを使い果たしたときにPが引き出す実行キュー
+GOMAXPROCSが1であっても(Pが1)Goプログラムは複数のスレッド(M)で実行される
+
+* runqueuesが空になったら
+待機しているGが無くなると別のPから実行キューの約半分を奪う
+コンテキストごとに常に作業が行われるようになり、すべてのスレッドが最大容量で動作
+
+* スケジューラーのハマりどころ
+
+* ハマりどころ1
+.play example/taro.go
+
+* ハマりどころ1
+メインルーチンとgoroutineがあるが、goroutineに切り替わるのは
+rangeが回りきってwg.Waitされた時点
+goroutineがforで宣言された変数をクロージャから参照するときには、uは三郎となってしまっており同じ値を参照してしまう
+
+* ハマりどころ1
+どういうときに切り替わるのか
+- アンバッファなチャネルへの読み書きが行われる
+- システムコールが呼ばれる(ディスクI/Oとか待ちが入る余地がない即座に帰ってくる系のものだとスイッチしない)
+- メモリの割り当てが行われる
+- time.Sleep()が呼ばれる
+- runtime.Gosched()が呼ばれる
+
+* ハマりどころ1
+Sleep入れてみる
+.play example/taro2.go /func main/,/^}/
+
+* ハマりどころ1
+ブロック内で再定義
+.play example/taro3.go /func main/,/^}/
+
+* ハマりどころ1
+引数として渡す
+.play example/taro4.go /func main/,/^}/
+
+* ハマりどころ2
+.play example/bomb.go
+.caption _Credit by [Péter Szilágyi]
+
+* ハマりどころ2
+GOMAXPROCSを1から5まで順に大きくしていくと、goroutineが切り替わりやすくなる事で表示される .の数が小さくなる
+
+* 参考資料
+.link https://morsmachine.dk/go-scheduler Morsing's Blog
+.link https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw/edit Design Doc
+- WEB+DB vol.95 牧さんの連載
+- Hoare, C. A. R. (1978). Communicating sequential processes. In The origin of concurrent programming (pp. 413-443). Springer New York.
+
+* お世話になった方々
+- Dave san
+- tenntenn san
+- deeeet san
